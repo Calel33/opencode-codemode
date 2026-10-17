@@ -1,0 +1,48 @@
+{
+  "name": "@boozedog/opencode-codemode",
+  "version": "0.1.0",
+  "description": "OpenCode v2 plugin: typed Code Mode execution (execute_tools) with explicit policy, ported from @boozedog/pi-codemode",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "codemode",
+    "sandbox",
+    "typescript"
+  ],
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.19"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.19",
+    "@types/node": "^26.6.5",
+    "@typesafe-ai/sdk": "^0.6.0"
+  },
+  "dependencies": {
+    "@jitl/quickjs-singlefile-mjs-release-sync": "^0.32.0",
+    "@modelcontextprotocol/client": "2.3.1",
+    "quickjs-emscripten-core": "^0.32.0",
+    "typescript": "^6.0.3"
+  },
+  "optionalDependencies": {
+    "@typesafe-ai/sdk": "^0.6.0"
+  }
+}
