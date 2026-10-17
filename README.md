@@ -134,12 +134,15 @@ the boundary.
   writes to `.mcp.json` and `.pi/` are policy-protected.
 * **`cli.<tool>.<operation>`** — typed, allowlisted CLI operations. Catalog:
   `git`, `rg`, `find`, `grep`, `ls`, `vitest`, `tsc`, `oxfmt`, `oxlint` (the
-  exact operations are declared in `src/capabilities/cli.ts`). Every call is
-  spawned with an argv array (`shell: false`), a minimal environment, and the
-  active root as cwd. Nonzero exit codes are returned as data. Each stream is
-  capped at 50 KiB (tail kept, explicit marker). No arbitrary commands: a
-  capability the allowlist does not grant is denied at dispatch even on a raw
-  bridge call.
+  exact operations are declared in `src/capabilities/cli.ts`). `find`, `ls`,
+  and `grep` are host-implemented **in-process** (Node fs, OS-independent — no
+  PATH lookup, no spawn; see the deviations bullet under Limitations). The
+  remaining tools are spawned with an argv array (`shell: false`), a minimal
+  environment, and the active root as cwd. Nonzero exit codes are returned as
+  data. Each spawned stream is capped at 50 KiB (tail kept, explicit marker);
+  in-process results set `truncated.stdout` when a cap bites. No arbitrary
+  commands: a capability the allowlist does not grant is denied at dispatch
+  even on a raw bridge call.
 * **`codemode.*` discovery** — `search_tools`, `list_mcp_servers`,
   `list_tools`, `describe_tools` over the live plugin-owned catalog (bounded).
 * **`mcp.<namespace>.<tool>`** — MCP tool calls through the **plugin-owned
@@ -172,6 +175,7 @@ the boundary.
 | CLI stdout, stderr | 50 KiB per stream (tail kept) |
 | CLI operation timeout | 30 000 ms default; `shell.run` up to 120 000 ms |
 | npm script plan | ≤ 32 steps; `package.json` ≤ 1 MiB |
+| `find`/`ls`/`grep` (in-process) | find/ls ≤ 2 000 entries; grep ≤ 1 000 files, 1 000 matches, 500 chars/line, 1 MiB/file, 16 MiB total; stdout backstop 50 KiB |
 | Jev state / input / answers / timeout | 12 000 chars / 50 KiB / 50 KiB / 8 000 ms default (≤ 60 000) |
 | MCP catalog | ≤ 16 servers, ≤ 200 tools/server, ≤ 40 schema params; results ≤ 50 KiB; search ≤ 50, list ≤ 100 |
 
@@ -246,6 +250,24 @@ Policy: `options.jev = { enabled, model, timeoutMs }` (defaults
 * **Windows `.cmd` shims.** CLI capabilities spawn with `shell: false`; an
   allowlisted executable must be a real binary under Node 24 (Bun's spawn also
   resolves `.cmd`). Prefer real executables (`git`, not a package-manager shim).
+  `find`, `ls`, and `grep` are exempt: they are **no longer PATH lookups at
+  all** (see the in-process bullet below) — Windows ships no usable `grep` and
+  no real `ls` binary (PowerShell alias only), and its `find.exe` is an
+  unrelated string-search utility, so a PATH-based spawn could only be wrong
+  there.
+* **In-process `find` / `ls` / `grep` (deliberate deviations).** These three
+  declared operations run on the host (Node fs, `src/capabilities/enumerate.ts`)
+  instead of spawning a binary; the catalog entries, allowlist gate, and typed
+  argument validation are unchanged. Documented deviations from POSIX: every
+  printed path is **root-relative** with forward slashes (the root itself
+  prints as `.`; POSIX prints the path as typed — root-relative is the safe
+  form inside the sandbox); `find`/`grep` walks skip `.git` and `node_modules`
+  and never descend symlinked directories (bounded, cycle-safe traversal —
+  POSIX `find` descends both); `ls -l` renders real `stat.mode` bits on POSIX
+  but synthesizes type-only modes on Windows (`drwxr-xr-x` / `-rw-r--r--` /
+  `lrwxrwxrwx`), which has no POSIX mode; `grep` prints its own stable
+  `<path>:<line>:<text>` format (1-indexed) and reports zero matches as exit
+  code 0, unlike POSIX grep's nonzero exit.
 * **`gh` CLI group deferred** (Pi's `gh` operations are not in this slice's catalog).
 
 ## Compatibility

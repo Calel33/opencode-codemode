@@ -28,7 +28,15 @@
 //     deferred from this slice; hostCommandEnv already carries its token
 //     surface, so a later slice can add adapters without touching the
 //     executor;
-//   - argument validation is hand-rolled per operation (no Ajv dependency).
+//   - argument validation is hand-rolled per operation (no Ajv dependency);
+//   - `find.files`, `grep.search` and `ls.list` are host-implemented IN-PROCESS
+//     (capabilities/enumerate.ts): they never consult PATH and never spawn.
+//     Windows ships no usable `grep`, no `ls` binary (PowerShell alias only),
+//     and an unrelated `find.exe` (Find String Utility), so spawning was wrong
+//     there; one Node-fs implementation stays OS-independent. The catalog
+//     entries below remain the single source of truth for the allowlist,
+//     validation, and the guest surface — only these three skip the
+//     argv/spawn path.
 // Logging: nothing here logs; results carry only stdout/stderr the spawned
 // tool itself produced.
 import { spawn } from "node:child_process"
@@ -36,6 +44,7 @@ import { dispatchError } from "../codemode/dispatch.js"
 import type { DispatchCapability, DispatchEnvironment, DispatchOutcome } from "../codemode/dispatch.js"
 import type { CliAllowlist } from "../config/policy.js"
 import { cliAllowlistAllows, hostCommandEnv } from "../security/allowlist.js"
+import { isEnumeratedOperation, runEnumeratedOperation } from "./enumerate.js"
 
 /** Per-stream output cap: preserved from the original package (50 KiB). */
 export const MAX_CLI_STREAM_BYTES = 50 * 1024
@@ -56,7 +65,8 @@ interface CliOperationDefinition {
 }
 
 interface CliToolDefinition {
-  readonly executable: string
+  /** Spawned executable; absent for host-implemented (in-process) operations. */
+  readonly executable?: string
   readonly operations: Readonly<Record<string, CliOperationDefinition>>
 }
 
@@ -348,7 +358,8 @@ export const CLI_TOOLS: Readonly<Record<string, CliToolDefinition>> = {
     },
   },
   find: {
-    executable: "find",
+    // Host-implemented in-process (enumerate.ts): no PATH lookup, no spawn —
+    // Windows `find.exe` is an unrelated string-search utility.
     operations: {
       files: {
         description: "Search for files by path, name, max depth, or type.",
@@ -365,7 +376,7 @@ export const CLI_TOOLS: Readonly<Record<string, CliToolDefinition>> = {
     },
   },
   grep: {
-    executable: "grep",
+    // Host-implemented in-process (enumerate.ts): stock Windows has no `grep`.
     operations: {
       search: {
         description: "Search file contents by pattern using grep.",
@@ -382,7 +393,8 @@ export const CLI_TOOLS: Readonly<Record<string, CliToolDefinition>> = {
     },
   },
   ls: {
-    executable: "ls",
+    // Host-implemented in-process (enumerate.ts): `ls` is a PowerShell alias
+    // on Windows (not a binary), so a spawn resolves to nothing.
     operations: {
       list: {
         description: "List directory contents.",
@@ -492,22 +504,47 @@ export interface CliInvocation {
   readonly argv: readonly string[]
 }
 
+/** Declared-operation lookup shared by the spawn plan and the in-process branch. */
+function resolveDeclaredOperation(
+  tool: string,
+  operation: string,
+): { readonly ok: true; readonly operationDef: CliOperationDefinition; readonly executable: string | undefined } | { readonly ok: false; readonly message: string } {
+  const toolDef = CLI_TOOLS[tool] as CliToolDefinition | undefined
+  if (toolDef === undefined) return { ok: false, message: `Unknown CLI tool: ${tool}` }
+  const operationDef = (toolDef.operations as Record<string, CliOperationDefinition | undefined>)[operation]
+  if (operationDef === undefined) return { ok: false, message: `Unknown CLI operation: cli.${tool}.${operation}` }
+  return { ok: true, operationDef, executable: toolDef.executable }
+}
+
+/** Typed-arg validation for a declared operation, without building an argv. */
+function validateDeclaredArgs(
+  tool: string,
+  operation: string,
+  args: unknown,
+): { readonly ok: true; readonly value: Record<string, unknown> } | { readonly ok: false; readonly message: string } {
+  const resolved = resolveDeclaredOperation(tool, operation)
+  if (!resolved.ok) return resolved
+  return validateCliArgs(resolved.operationDef, args)
+}
+
 /** Validated plan for one declared operation: executable + literal argv array. */
 export function buildCliInvocation(
   tool: string,
   operation: string,
   args: unknown,
 ): { readonly ok: true; readonly invocation: CliInvocation } | { readonly ok: false; readonly message: string } {
-  const toolDef = CLI_TOOLS[tool] as CliToolDefinition | undefined
-  if (toolDef === undefined) return { ok: false, message: `Unknown CLI tool: ${tool}` }
-  const operationDef = (toolDef.operations as Record<string, CliOperationDefinition | undefined>)[operation]
-  if (operationDef === undefined) return { ok: false, message: `Unknown CLI operation: cli.${tool}.${operation}` }
-  const validated = validateCliArgs(operationDef, args)
+  const resolved = resolveDeclaredOperation(tool, operation)
+  if (!resolved.ok) return resolved
+  const validated = validateCliArgs(resolved.operationDef, args)
   if (!validated.ok) return validated
+  const executable = resolved.executable
+  if (executable === undefined) {
+    return { ok: false, message: `cli.${tool}.${operation} is host-implemented in-process and has no spawned executable` }
+  }
   try {
-    return { ok: true, invocation: { executable: toolDef.executable, argv: operationDef.toArgv(validated.value) } }
+    return { ok: true, invocation: { executable, argv: resolved.operationDef.toArgv(validated.value) } }
   } catch (error) {
-    return { ok: false, message: error instanceof Error ? error.message : String(error) }
+    return { ok: false, message: errorMessage(error) }
   }
 }
 
@@ -585,9 +622,10 @@ export function createCliCapabilities(allowlist: CliAllowlist): readonly Dispatc
 
 /**
  * The one execution path for a declared CLI operation: allowlist re-check →
- * abort/root check → validated argv build → spawnCli. Exported so the Task 8
- * npm script runner (capabilities/npm-scripts.ts) executes planned steps
- * through THIS pipeline (no shell, per-op bounds, nonzero exit as data).
+ * abort/root check → typed-arg validation → in-process enumeration (find,
+ * grep, ls) OR validated argv build → spawnCli. Exported so the Task 8 npm
+ * script runner (capabilities/npm-scripts.ts) executes planned steps through
+ * THIS pipeline (no shell, per-op bounds, nonzero exit as data).
  */
 export async function runCliOperation(
   tool: string,
@@ -606,6 +644,13 @@ export async function runCliOperation(
   if (env.signal?.aborted) return dispatchError("cancelled", "Execution cancelled")
   if (typeof env.root !== "string" || env.root.length === 0) {
     return dispatchError("root", "the active project root is unknown; CLI capabilities are disabled")
+  }
+  // In-process branch (find/grep/ls): the same gate and typed-arg validation
+  // as the spawned tools, but no PATH lookup and no spawn (enumerate.ts).
+  if (isEnumeratedOperation(tool, operation)) {
+    const validated = validateDeclaredArgs(tool, operation, input)
+    if (!validated.ok) return dispatchError("input", validated.message)
+    return runEnumeratedOperation(tool, operation, validated.value, env)
   }
   const built = buildCliInvocation(tool, operation, input)
   if (!built.ok) return dispatchError("input", built.message)
